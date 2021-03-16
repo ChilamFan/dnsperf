@@ -23,6 +23,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <time.h>
 #include <signal.h>
 #include <errno.h>
 
@@ -53,6 +54,7 @@ typedef struct timeval timeval_t;
 #define DEFAULT_C_QUERY_NUM "100"
 
 #define MAX_DOMAIN_LEN     255
+#define MAX_IP_LEN     27
 
 
 /* query states */
@@ -67,6 +69,10 @@ typedef struct data_s {
     unsigned int  len;         /* domain's len */
     char          domain[MAX_DOMAIN_LEN];
 } data_t;
+
+typedef struct geo_s {
+    char          geo_ip[MAX_IP_LEN];
+} geo_t;
 
 typedef struct query_s {
     dns_perf_event_ops_t ops;
@@ -93,10 +99,11 @@ typedef struct query_s {
 /*
  * Global vars.
  */
+int           geo_index;
 char         *g_name_server;
 unsigned int  g_name_server_port;
 char         *g_data_file_name;
-char         *g_real_client;
+char         *g_geo_file_name;
 unsigned int  g_timeout;
 unsigned int  g_perf_time;
 unsigned int  g_query_number;
@@ -112,7 +119,9 @@ timeval_t     g_query_end;
 
 /* Stores <domain, qtype> read from data `g_data_file_handler' */
 data_t       *g_data_array;
+geo_t       *g_geo_array;
 int           g_data_array_len;
+int           g_geo_array_len;
 query_t      *g_query_array;   /* len = g_concurrent_query */
 
 /* epoll vars */
@@ -186,22 +195,22 @@ int dns_perf_set_str(char **dst, char *src)
         return -1;
     }
 
-	free(*dst);
+    free(*dst);
 
-	if ((*dst = malloc(strlen(src) + 1)) == NULL) {
-		fprintf(stderr, "Error allocating memory for server name: %s\n", src);
-		return -1;
-	}
+    if ((*dst = malloc(strlen(src) + 1)) == NULL) {
+        fprintf(stderr, "Error allocating memory for server name: %s\n", src);
+        return -1;
+    }
 
     memset(*dst, '\0', strlen(src) + 1);
     memcpy(*dst, src, strlen(src));
 
-	return 0;
+    return 0;
 }
 
 int dns_perf_set_uint(unsigned int *dst, char *src)
 {
-	unsigned int val;
+    unsigned int val;
 
     val = atol(src);
     if (val <= 0 && val > 65535) {
@@ -210,7 +219,7 @@ int dns_perf_set_uint(unsigned int *dst, char *src)
 
     *dst = val;
 
-	return 0;
+    return 0;
 }
 
 void sig_handler(int signo)
@@ -257,6 +266,7 @@ int dns_perf_timer_cmp(timeval_t a, timeval_t b)
 }
 
 
+
 timeval_t dns_perf_timer_add_long(timeval_t a, long b)
 {
     timeval_t ret;
@@ -282,7 +292,7 @@ int dns_perf_valid_qtype(char *qtype)
         "AAAA", "SRV", "NAPTR", "A6", "AXFR", "MAILB", "MAILA", "*", "ANY"};
 
     static int qtype_codes[] =  {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-        15, 16,	28, 33, 35, 38, 252, 253, 254, 255, 255};
+        15, 16, 28, 33, 35, 38, 252, 253, 254, 255, 255};
 
     int   qtype_len = sizeof(qtypes) / sizeof(qtypes[0]);
     int   i;
@@ -386,8 +396,8 @@ int dns_perf_parse_args(int argc, char **argv)
             break;
 
         case 'e':
-            if (dns_perf_set_str(&g_real_client, optarg) == -1) {
-                fprintf(stderr, "Error setting edns client ip %s\n", optarg);
+            if (dns_perf_set_str(&g_geo_file_name, optarg) == -1) {
+                fprintf(stderr, "Error setting geofile %s\n", optarg);
                 return -1;
             }
             break;
@@ -493,6 +503,72 @@ int dns_perf_data_array_init()
     return 0;
 }
 
+
+int dns_perf_geo_array_init()
+{
+    FILE    *file;
+    char     buf[1024], geo_ip[MAX_IP_LEN];
+    int      len = 0;
+    geo_t  *geo;
+
+    if (g_geo_file_name == NULL) {
+        return -1;
+    }
+
+
+    if ((file = fopen(g_geo_file_name, "r")) == NULL) {
+        return -1;
+    }
+
+    /* Calculate how many useful lines */
+    while(fgets(buf, 1024, file) != 0) {
+        if (buf[0] == '#' || buf[0] == '\n') {
+            continue;
+        }
+
+        len++;
+    }
+
+    if ((g_geo_array = calloc(len, sizeof(geo_t))) == NULL) {
+        fprintf(stderr, "Malloc memory error");
+        goto finish;
+    }
+
+    rewind(file);
+    g_geo_array_len = 0;
+    while(fgets(buf, 1024, file) != 0) {
+        if (buf[0] == '#' || buf[0] == '\n') {
+            continue;
+        }
+
+        if (sscanf(buf, "%s", geo_ip) == EOF) {
+            fprintf(stderr, "Error string in geo file:%s\n", buf);
+            goto finish;
+        }
+
+        if (strlen(geo_ip) > MAX_IP_LEN) {
+            fprintf(stderr, "Error ip too long:%s\n", geo_ip);
+            goto finish;
+        }
+
+
+        geo = &g_geo_array[g_geo_array_len];
+        memcpy(geo->geo_ip, geo_ip, strlen(geo_ip));
+
+        g_geo_array_len++;
+    }
+
+ finish:
+
+    if (fclose(file) != 0) {
+        free(g_geo_array);
+        return -1;
+    }
+
+    return 0;
+}
+
+
 /*
  * Do I need write description to this file? I don't think so.
  */
@@ -526,7 +602,7 @@ int dns_perf_generate_query(query_t *q)
     q->send_buf[0] = p[0];
     q->send_buf[1] = p[1];
 
-    if (g_real_client) {
+    if (g_data_file_name) {
         q->send_buf[11] = 1;   /* set additional count to  1 */
 
         p = q->send_buf + len; /* p points to additional section */
@@ -559,8 +635,9 @@ int dns_perf_generate_query(query_t *q)
 
         *p++ = 32;     /* source netmask: 32 */
         *p++ = 0;      /* scope netmask: 0 */
-
-        addr = inet_addr(g_real_client);  /* client subnet */
+        srand(time(NULL));
+        geo_index = rand() % g_geo_array_len;
+        addr = inet_addr(g_geo_array[geo_index].geo_ip);  /* client subnet */
         t = (u_char *) &addr;
 
         *p++ = *t++;
@@ -849,7 +926,7 @@ static void dns_perf_statistic()
 
     diff = dns_perf_timer_sub(g_query_end, g_query_start);
     msec = diff.tv_sec * 1000 + diff.tv_usec / 1000;
-
+    
     printf("\n[Status]DNS Query Performance Testing Finish\n");
     printf("[Result]Quries sent:\t\t%d\n", g_send_number);
     printf("[Result]Quries completed:\t%d\n", g_recv_number);
@@ -912,6 +989,9 @@ int dns_perf_setup(int argc, char **argv)
     }
 
     if (dns_perf_data_array_init() == -1) {
+        return -1;
+    }
+    if (dns_perf_geo_array_init() == -1) {
         return -1;
     }
 
@@ -988,9 +1068,9 @@ int main(int argc, char** argv)
     free(g_query_array);
     free(g_name_server);
     free(g_data_file_name);
+    free(g_geo_file_name);
 
     dns_perf_eventsys_destroy();
 
     return 0;
 }
-
